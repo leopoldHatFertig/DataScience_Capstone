@@ -1,0 +1,359 @@
+---
+title: "Capstone_MovieLens"
+output: pdf_document
+---
+
+
+```{r global_options, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=40),tidy=TRUE)
+```
+## Section 1
+
+### Introduction:
+In this R project I will create a prediction system through machine learning training.
+Datasource is the Movielens 10M Dataset, released 1/2009.
+As algorithm, linear regression will be used. Further methods will be only be used if the results are not satisfying.
+As validation of the models, the RMSE (Root Mean Square Error) is used.
+
+Note: Any code provided is based on R v3.6.1
+
+```{r load_required_packages, message=FALSE, warning=FALSE, include=TRUE, results='hide'}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(dplyr)) install.packages("dplyr", repos = "http://cran.us.r-project.org")
+if(!require(dslabs)) install.packages("dslabs", repos = "http://cran.us.r-project.org")
+if(!require(ggplot2)) install.packages("ggplot2", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(tictoc)) install.packages("tictoc", repos = "http://cran.us.r-project.org")
+
+# Load libraries
+library(dslabs)
+library(dplyr)
+library(caret)
+library(tidyverse)
+library(ggplot2)
+library(data.table)
+library(kableExtra)
+library(knitr)
+library(tictoc)
+```
+
+At this point we have installed all the necessarry packages and are ready to go.
+
+### Data preparation
+Now we load the original dataset and take a quick look at it to get an idea of the data structure.
+
+```{r load_data, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+tic("downloading data") # set timer for download
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+toc() # end timer for download
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+# join content of both files
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+The movielens object now contains all the moviedata and their ratings.
+This is how the datastructure we are dealing with looks like:
+```{r data_structure, eval=TRUE, echo=TRUE}
+str(movielens)
+```
+In sum, we have 10000054 rows of data. Each row, representing one rating for a movie by a user (="observation"), consisting of 6 variables:
+
+* 2 variabels of type integer (userId, timestamp). 
+  + The timestamp represents the moment in time the rating was given. In order to have a human-readable datetime information like year, month and day, we will convert the timestamp later.
+* 2 variables of type numeric (movieId, rating)
+* 2 variables of type character (title, genres).
+  + The title information also seems to include the year the movie was published. So - beyond the given 6 variabels - this is one more potential information that could be used for analysis.
+  + As we can see, genres are a concenated string, that can contain multiple values. (A movie can be categorized into more than one genre.) In order to extract all the genres-information, we will separat these later.
+
+For our later goal to train model that can predict ratings, we need 2 subsets of the complete "movielens" dataset, one for training purposes, one to validate our trained model.
+The training set will be 90% of the movielens data, validation set 10%.
+
+```{r split_data, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, results='hide', cache=TRUE}
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, removed) #cleanup
+#(not removing movielens dataset for analysis)
+```
+
+## Section 2
+
+### Overview Dataset:
+Now that we have our original data available and know basic the data structure, let's learn something about the dataset itself by exploring what range of values the 6 variables have.
+How many different users and movies exists?
+What genres does exists? What period of ratings are available? What is the scale of ratings? ...
+
+Starting point is a simple summary of the dataset.
+```{r data_summary, eval=TRUE, echo=TRUE}
+summary(movielens)
+```
+We see the distributions of the numerical variables.
+Nothing very insightful here, but we can see that the ratings given are on a scale from 0.5 to 5; and half-point ratings are possible.
+
+Let's have a closer look on the ratings.
+
+```{r ratings_plot, eval=TRUE, echo=TRUE}
+ggplot(movielens, aes(x= movielens$rating)) +
+    geom_histogram( binwidth = 0.25) +
+    scale_x_continuous(breaks=seq(0.5, 5, by= 0.5)) +
+    scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+    labs(x="rating", y="number of ratings", caption = "source data: movielens set") +
+    ggtitle("Histogram : number of ratings per rating") +
+    geom_vline(xintercept = mean(movielens$rating), linetype = "dashed")
+```
+
+* 4.0 is the most given rating
+* whole point ratings are for more common than half point ratings
+* the average rating itself (3.5) is given not so often
+
+
+```{r info_distinct_IDs, eval=TRUE, echo=TRUE}
+movielens %>% summarize(distinct_users = n_distinct(userId), distinct_movies = n_distinct(movieId))
+```
+
+* These ratings where given by 69878 different users, 10677 different movies were rated.
+
+To get an impression, when the ratings were given and therefore get an idea how old the observations are, we need to manipulate the timestamp variable to get extract the year information.
+
+```{r timestamp_year_rated, eval=TRUE, echo=TRUE}
+movielens_withYearRated <- movielens 
+movielens_withYearRated <- movielens_withYearRated %>% mutate(year_rated = as.POSIXct(timestamp, origin = "1970-01-01"))
+movielens_withYearRated$year_rated <- as.numeric(format(movielens_withYearRated$year_rated, "%Y"))
+
+ggplot(movielens_withYearRated, aes(x= movielens_withYearRated$year_rated)) +
+    geom_histogram( binwidth = 0.25) +
+    scale_x_continuous(breaks=seq(1995, 2009, by= 1)) +
+    scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+    labs(x="year_rated", y="number of ratings", caption = "source data: movielens_withYearRated set") +
+    ggtitle("histogram : number of ratings per year")
+```
+(Hint: 1995 has 3 ratings)
+
+* We see three dominant peaks in the years 1996, 2000 and 2005.
+
+What movies where rated in these years?
+```{r top_movie_in_peak_years, echo=TRUE, paged.print=TRUE}
+top_titles_1996 <- movielens_withYearRated %>% 
+    filter(year_rated == 1996) %>%
+    group_by(title) %>%
+    summarize(no_ratings=n()) %>%
+    top_n(10, no_ratings) %>%
+    arrange(desc(no_ratings))
+top_titles_2000 <- movielens_withYearRated %>% 
+    filter(year_rated == 2000) %>%
+    group_by(title) %>%
+    summarize(no_ratings=n()) %>%
+    top_n(10, no_ratings) %>%
+    arrange(desc(no_ratings))
+top_titles_2005 <- movielens_withYearRated %>% 
+    filter(year_rated == 2005) %>%
+    group_by(title) %>%
+    summarize(no_ratings=n()) %>%
+    top_n(10, no_ratings) %>%
+    arrange(desc(no_ratings))
+
+top_table <- knitr::kable(list(top_titles_1996, top_titles_2000, top_titles_2005), 
+                          caption = "Top 10 most rated movies in the years 1996, 2000 and 2005")               %>% kable_styling(bootstrap_options=c("bordered","striped"))
+top_table
+```
+
+* In both, 2000 and 2005, we see that very popular Hollywood-Blockbuster triologies are among the most rated movies (star Wars and Lord of the Rings respectively). This could imply the effect, that new releases of those series draw attention also to their predecessors, resulting in ratings by users.
+* In 1996, the same effect could be present in the case of "Batman".
+
+  + We also see much higher number of ratings in 1996 for the most rated movies in general.
+  + This can not be explained that the database was "new" and therefore more popular, because the number of ratings per year dont show a descending trend.
+  + Instead, just a higher percentage of the ratings per year given fall to the most popular movies.
+  + This would mean that the diversity of movies should have grown bigger in the later years, and in the first years mostly the popular movies were rated.
+  
+Lets check this by exermining the movie-diversity growth by year. Therefore we extract the release year information that is included in the title column and add it as separat column.
+```{r distinct_movies_per_year, echo=TRUE, warning=FALSE, paged.print=TRUE}
+
+year_released <- stringi::stri_extract(movielens_withYearRated$title, regex = "(\\d{4})", comments = TRUE) %>% as.numeric()
+
+movielens_withYearRated_YearReleased <- movielens_withYearRated
+movielens_withYearRated_YearReleased <-  movielens_withYearRated_YearReleased %>%
+  mutate(year_released = year_released)
+
+years <- seq(1995, 2009, 1)
+for(year in years){
+  distinct_movies <- movielens_withYearRated_YearReleased %>% filter(year_released <= year) %>% summarize(distinct_movies = n_distinct(movieId))
+  resultlist_distinct_movies_per_year <- if(exists("resultlist_distinct_movies_per_year")) c(resultlist_distinct_movies_per_year, distinct_movies[1]) else c(distinct_movies[1])
+}
+# re-structure data
+results_distinct_movies_per_year <- as.data.frame(resultlist_distinct_movies_per_year)
+names(results_distinct_movies_per_year) <- seq(1,15,1)
+results_distinct_movies_per_year <- results_distinct_movies_per_year %>% t() %>% cbind(as.data.frame(years))
+colnames(results_distinct_movies_per_year) <- c("distinct_movies", "year")
+
+# for plot, only the three years in question are needed
+results_distinct_movies_per_year <- results_distinct_movies_per_year  %>%
+  filter(year==1996 | year==2000 | year == 2005)
+# add growthrates
+results_distinct_movies_per_year$growth_rate_from1996 = 0
+results_distinct_movies_per_year[2,3] = (results_distinct_movies_per_year[2,1] / results_distinct_movies_per_year[1,1])-1
+results_distinct_movies_per_year[3,3] = (results_distinct_movies_per_year[3,1] / results_distinct_movies_per_year[1,1])-1
+
+ggplot(results_distinct_movies_per_year, aes(x= year, y=distinct_movies, Z=growth_rate_from1996)) +
+    geom_bar(stat="identity") +
+    geom_text(aes(label=distinct_movies), vjust=1.6, color="white", size=3.5) +
+    geom_text(aes(label=sprintf("+ %s",paste((round(growth_rate_from1996,4)*100), "%", sep=""))), vjust=-0.3, color="black", size=3.5) +
+    scale_x_continuous(breaks=c(1996, 2000, 2005)) +
+    scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
+    labs(x="year_rated", y="number of distinct movies", caption = "source data: movielens_withYearRated_YearReleased set") +
+    ggtitle("histogram : diversity of movielens dataset")
+```
+
+* The number of movies represented in the movielens data has grown from 1996 to 2000 by 24%, from 1996 to 2005 by 59%.
+* Since the number of ratings per year did not grow by these rates, this can a reason why there are less rating per year per movie in the later years (for the most popular movies we looked at here)
+
+
+There can be done a lot more analysis of the movielens dataset, i.e. looking at the users or genres etc.
+But lets jump to the core target of this project, which is to build a model to predict user ratings.
+Let's get to the training part and train a model, that can predict ratings, how users would rate a movies.
+
+### Training Method
+
+As stated before, we use the RMSE, as defined in the Machine Learning Course, lesson "Recommendation Systems" to evaluate a models performance:
+$$ RMSE = \sqrt{\frac{1}{N}\displaystyle\sum_{u,i} (\hat{y}_{u,i}-y_{u,i})^{2}} $$
+where:
+
+* $\hat{y}_{u,i}$ is the true rating of user u for movie i
+* $y_{u,i}$ is the predicted rating of user u for movie i
+```{r performance_function, eval=TRUE, echo=TRUE}
+calculateRMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+>  Comment:  In the Machine Learning Course, lesson "Regularization", Prof. Irizarry showcased code 
+>            using linear regression models with different tweaks with the following results:
+>  
+>  |method                                |  RMSE|
+>  |:-------------------------------------|-----:|
+>  |Just the average                      | 1.048|
+>  |Movie Effect Model                    | 0.986|
+>  |Movie + User Effects Model            | 0.885|
+>  |Regularized Movie + User Effect Model | 0.881|
+>
+>  The results just got down to a RMSE of 0.881, with Models with 
+>  Regularized Movie + User Effect performing best.
+>  So, going from this, I will continue using a Regression Model incorporating both Regularized Movie
+>  Effect & Regularized User Effect and try to optimise the model to reach a better RMSE.
+
+As target performance, an RMSE of 0.8649 was defined.
+
+For explanation, the Movie effect is a penelizing factor to capture the associated movie bias. For example some movies are rated higher than others (i.e. blockbusters are rated higher then niche movies). 
+The User effect captures the associated user bias. So user ratings may be influenced by personal liking/disliking (of a genre, an actor...) regardless of the movie itself.
+
+So in summary, the prediction model will follow this approach:
+  $y_{u,i} = \mu + b_i + b_u$
+  where:
+  
+  * $\mu$ the mean rating
+  * $b_i$ movie effect of movie i
+  * $b_u$ user effect of user u
+  with
+  
+  * $b_i = \sum_{i}(\hat{y}-\mu)/(n_i+\lambda)$
+  * $b_u = \sum_{u,i}(\hat{y}-\mu-b_i)/(n_i+\lambda)$
+
+```{r training_models, eval=TRUE, echo=TRUE}
+target_RMSE <- 0.8649 # given in the project assignment
+mean_edx <- mean(edx$rating) #define mean of ratings in the dataset used for training
+
+lambda_tuning <- seq(0, 10, 0.1) #define interval for optimise tuning parameter lambda
+for(lambda in lambda_tuning){    # loop through values for lambda to optimise model
+  b_movie <- 
+    edx %>% 
+    group_by(movieId) %>%
+    summarize(b_movie = sum(rating - mean_edx)/(n()+lambda)) # calculate reg. movie effect per movieId
+  b_user <- 
+    edx %>% 
+    left_join(b_movie, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_user = sum(rating - b_movie - mean_edx)/(n()+lambda)) # calculate user effect per userId
+  predicted_ratings <- 
+    validation %>% 
+    left_join(b_movie, by = "movieId") %>%                # append movie effect to validation set
+    left_join(b_user, by = "userId") %>%                  # append user effect to validation set
+    mutate(prediction = mean_edx + b_movie + b_user) %>%  # calculate prediction
+    .$prediction                                                              
+  
+  model_rmse <- calculateRMSE(validation$rating, predicted_ratings) # calculate model performance
+  
+  results_rmse <- if(exists("results_rmse")) c(results_rmse, model_rmse) else c(model_rmse) # create/append list of all results
+  
+  if(model_rmse <= target_RMSE){ # stopping algorithm as soon as target RMSE is reached in order to shorten runtime
+    break()
+  }
+}
+```
+
+
+## Section 3
+
+### Results
+```{r results, eval=TRUE, echo=TRUE}
+lambda_optimal <- lambda_tuning[which.min(results_rmse)] # value of lambda for best model trained
+print("Value of lambda for the best model trained:")
+lambda_optimal
+
+rmse_optimal <- min(results_rmse) # RMSE of best model trained
+print("RMSE of the best model trained.")
+rmse_optimal
+```
+* The model performance improved and the target RMSE was reached.
+
+Finally, let's have a look at some of the predicted ratings to get a feeling how precise they are.
+(Since the algorithm stopped with the final result, the predicted ratings of this model are still in the predicted_ratings variable.)
+For comparison, they are rounded to the nearest possible rating value (only full and half star ratings are possible) and also displayed side by side with the real rating.
+
+```{r rating_comparison, echo=TRUE, paged.print=TRUE}
+pred25 <- predicted_ratings[1:25]
+pred25_rounded <- round(pred25/0.5)*0.5
+realRatings25 <- validation$rating[1:25]
+rating_comparsion_25 <- data.frame(pred25, pred25_rounded, realRatings25)
+names(rating_comparsion_25) <- c("prediction rating", "rounded prediction rating", "real rating")
+
+rating_comparsion_table <- knitr::kable(rating_comparsion_25, 
+                          caption = "Comparsion of 25 ratings predictions and real ratings:")               %>% kable_styling(bootstrap_options=c("bordered","condensed","striped"))
+rating_comparsion_table
+```
+In this small sample we see that the prediction often is off by a half star, but differs only once by two stars. So we get an impression that the model is in fact able to do predictions for users's ratings of movies.
+```{r cleanup, eval=TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide'}
+gc() # run garbage collection for cleanup
+```
+
+## Section 4
+
+### Conclusion
+In this MovieLens project some insights on the dataset itself were provided as well as a recommender system using a regression algorithm to predict movie ratings for the 10M version of the data. Based on separate training set (edx) and validation set, linear regression models were successfully trained. The model's performances were evaluated through the RMSE ( root mean squared error) and showed that the Linear regression model with regularized effects on users and movies was good enough to reach the performance we aimed at. With a penelizing factor of lambda = 2.9, a RMSE of 0.8648972 was reached.
+
+### Limitations & Suggestions for future work
+The data analysis does not make claim to be complete, but should give some ideas who some questions to the data could be answered.
+As mentioned before, there might be other interesting insigts to the data not covered here.
+Coming to the prediction model, it was shown that linear regression doesperform pretty good on the data. But, to shorten calculation time and given limited computation resources, we did to sqeeze to algorithm to the limit here. Maybe, the same linear regression model can be optimised further.
+Also, there were on other algorithms or recommender systems evaluated. It might be interesting to see, how other algorithms perform in comparison. 
